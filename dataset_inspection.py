@@ -3,15 +3,9 @@ from os.path import isfile, join
 import os
 import pandas as pd
 import numpy as np
-from dotenv import load_dotenv
 
 # --- Settings ---
 csv_path = "datasets/03-11"
-load_dotenv()
-
-key = os.environ.get("SECRET_KEY")
-print(key)
-
 
 # --- Step 1: Load all CSVs into list of DataFrames ---
 all_files = [f for f in listdir(csv_path) if isfile(join(csv_path, f))]

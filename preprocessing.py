@@ -1,56 +1,59 @@
 from os import listdir
 from os.path import isfile, join
-import os
+import os, re, tempfile
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
 from pprint import pprint
+from sqlalchemy import create_engine, text
+from sqlalchemy.types import DateTime, Float, Integer
 
 
 def selecting_feature_set(df):
     print("----- 1. Selecting Final Feature Set -----")
     selected_features = [
-        " Timestamp",
+        "timestamp",
 
         # Traffic volume & throughput
-        " Flow Duration",
-        " Total Fwd Packets",
-        " Total Backward Packets",
-        "Flow Bytes/s",
-        " Flow Packets/s",
-        " Average Packet Size",
+        "flow_duration",
+        "total_fwd_packets",
+        "total_backward_packets",
+        "flow_bytes/s",
+        "flow_packets/s",
+        "average_packet_size",
 
         # Packet size stats
-        " Packet Length Mean",
-        " Packet Length Std",
-        " Fwd Packet Length Mean",
-        " Bwd Packet Length Mean",
+        "packet_length_mean",
+        "packet_length_std",
+        "fwd_packet_length_mean",
+        "bwd_packet_length_mean",
 
         # Timing / burstiness 
-        " Flow IAT Mean",
-        " Flow IAT Std",
-        " Fwd IAT Mean",
-        " Bwd IAT Mean",
-        "Active Mean",
-        "Idle Mean",
+        "flow_iat_mean",
+        "flow_iat_std",
+        "fwd_iat_mean",
+        "bwd_iat_mean",
+        "active_mean",
+        "idle_mean",
 
         # Asymmetry 
-        " Down/Up Ratio",
-        " Avg Fwd Segment Size",
-        " Avg Bwd Segment Size",
+        "down/up_ratio",
+        "avg_fwd_segment_size",
+        "avg_bwd_segment_size",
 
         # TCP flag behavior 
-        " SYN Flag Count",
-        " ACK Flag Count",
-        " RST Flag Count",
+        "syn_flag_count",
+        "ack_flag_count",
+        "rst_flag_count",
 
         # Protocol context 
-        " Protocol",
-        " Destination Port",
+        "protocol",
+        "destination_port",
 
         # Label for anomaly detection
-        " Label"
+        "label"
     ]
+
     
     df = df[selected_features]
     return df
@@ -100,19 +103,22 @@ def handling_missing_vals(
 
     # column groups 
     interp_cols = [
-        " Flow Duration", " Total Fwd Packets", " Total Backward Packets",
-        "Flow Bytes/s", " Flow Packets/s", " Average Packet Size",
-        " Packet Length Mean", " Packet Length Std",
-        " Fwd Packet Length Mean", " Bwd Packet Length Mean",
-        " Down/Up Ratio", " Avg Fwd Segment Size", " Avg Bwd Segment Size"
+        "flow_duration", "total_fwd_packets", "total_backward_packets",
+        "flow_bytes/s", "flow_packets/s", "average_packet_size",
+        "packet_length_mean", "packet_length_std",
+        "fwd_packet_length_mean", "bwd_packet_length_mean",
+        "down/up_ratio", "avg_fwd_segment_size", "avg_bwd_segment_size"
     ]
+
     ffill_cols = [
-        " Flow IAT Mean", " Flow IAT Std", " Fwd IAT Mean", " Bwd IAT Mean",
-        "Active Mean", "Idle Mean",
-        " SYN Flag Count", " ACK Flag Count", " RST Flag Count",
-        " Protocol", " Destination Port"
+        "flow_iat_mean", "flow_iat_std", "fwd_iat_mean", "bwd_iat_mean",
+        "active_mean", "idle_mean",
+        "syn_flag_count", "ack_flag_count", "rst_flag_count",
+        "protocol", "destination_port"
     ]
-    categoricals = [" Protocol", " Destination Port"]
+
+    categoricals = ["protocol", "destination_port"]
+
 
     # filter only existing columns
     interp_cols = [c for c in interp_cols if c in df.columns]
@@ -169,58 +175,209 @@ def handling_missing_vals(
 
     return (df, report) if return_report else df
 
-    
-def preprocessing(csv_path, interval="5S"):
-    # Collect all CSV files in the folder
+
+def _mode(series: pd.Series):
+    s = series.dropna()
+    if s.empty:
+        return np.nan
+    m = s.mode()
+    return m.iloc[0] if not m.empty else np.nan
+
+
+def _top_attack_type(series: pd.Series):
+    s = series.dropna().astype(str)
+    att = s[s != "BENIGN"]
+    if att.empty:
+        return "BENIGN"
+    m = att.mode()
+    return m.iloc[0] if not m.empty else "BENIGN"
+
+
+def resampling(df: pd.DataFrame, interval: str = "5s") -> pd.DataFrame:
+    df = df.copy()
+
+    # --- timestamp -> index (sabit grid & sağ kapalı pencere)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+
+    # --- birim düzeltmesi ve yardımcı kolonlar
+    # CICDDoS2019: Flow Duration mikro-saniye -> saniye
+    df["flow_duration_s"] = pd.to_numeric(df.get("flow_duration", 0), errors="coerce").fillna(0) / 1e6
+    df["total_packets"] = pd.to_numeric(df.get("total_fwd_packets", 0), errors="coerce").fillna(0) + \
+                          pd.to_numeric(df.get("total_backward_packets", 0), errors="coerce").fillna(0)
+
+    # --- agregasyon
+    agg = df.resample(interval, label="right", closed="right", origin="epoch").agg({
+        "total_fwd_packets": "sum",
+        "total_backward_packets": "sum",
+        "total_packets": "sum",
+        "syn_flag_count": "sum",
+        "ack_flag_count": "sum",
+        "rst_flag_count": "sum",
+        "flow_duration_s": "sum",
+        "average_packet_size": "mean",
+        "packet_length_mean": "mean",
+        "packet_length_std": "mean",
+        "fwd_packet_length_mean": "mean",
+        "bwd_packet_length_mean": "mean",
+        "flow_iat_mean": "mean",
+        "flow_iat_std": "mean",
+        "fwd_iat_mean": "mean",
+        "bwd_iat_mean": "mean",
+        "active_mean": "mean",
+        "idle_mean": "mean",
+        "down/up_ratio": "mean",
+        "avg_fwd_segment_size": "mean",
+        "avg_bwd_segment_size": "mean",
+        "protocol": lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else np.nan,
+        "destination_port": lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else np.nan,
+        "label": lambda s: (
+            "BENIGN" if s.dropna().eq("BENIGN").all()
+            else (s[s.ne("BENIGN")].mode().iloc[0] if not s[s.ne("BENIGN")].mode().empty else "BENIGN")
+        ),
+    })
+
+    # --- oran/ hızlar (0 süreye karşı güvenli)
+    dur = agg["flow_duration_s"].replace(0, np.nan)  # 0 saniyeyi NaN yap → bölme inf olmaz
+    agg["flow_packets_s"] = agg["total_packets"] / dur
+    # Gerçek byte toplamları yoksa bytes/s hesaplamasını atla; varsa burada kullan:
+    # agg["flow_bytes_s"] = agg["total_bytes"] / dur
+
+    # --- isim iyileştirme: label -> top_attack_type
+    agg = agg.rename(columns={"label": "top_attack_type"})
+
+    # --- inf/-inf -> NaN; sayısallar için makul doldurma
+    agg = agg.replace([np.inf, -np.inf], np.nan)
+    count_cols = ["total_fwd_packets","total_backward_packets","total_packets",
+                  "syn_flag_count","ack_flag_count","rst_flag_count","flow_duration_s"]
+    for c in count_cols:
+        if c in agg.columns:
+            agg[c] = agg[c].fillna(0)
+
+    # top_attack_type boşsa BENIGN
+    if "top_attack_type" in agg.columns:
+        agg["top_attack_type"] = agg["top_attack_type"].fillna("BENIGN")
+
+    # --- timestamp'i kolona geri koy
+    agg.index.name = "timestamp"
+    agg = agg.reset_index()
+
+    return agg
+
+
+def make_engine_from_env():
+    load_dotenv()  # reads .env in current working dir
+    host = os.getenv("PGHOST", "localhost")
+    port = os.getenv("PGPORT", "5432")
+    user = os.getenv("PGUSER", "postgres")
+    pwd  = os.getenv("PGPASSWORD", "")
+    db   = os.getenv("PGDATABASE", "postgres")
+    url = f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}"
+    return create_engine(url, pool_pre_ping=True)
+
+
+def ensure_schema(engine, schema: str):
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+
+
+def save_fast_with_copy(engine, df: pd.DataFrame, schema: str, table: str,
+                         if_exists: str = "replace", make_unlogged: bool = True,
+                         sanitize_cols: bool = True):
+    """Create table from df schema, then bulk-load rows using COPY (very fast)."""
+    # (optional) sanitize weird column names for DB friendliness
+    if sanitize_cols:
+        safe_cols = []
+        for c in df.columns:
+            cc = re.sub(r"\W+", "_", c).strip("_").lower()  # letters/digits/_ only
+            safe_cols.append(cc or "col")
+        df = df.copy()
+        df.columns = safe_cols
+
+    with engine.begin() as conn:
+        if if_exists not in {"replace", "append", "fail"}:
+            raise ValueError("if_exists must be 'replace' | 'append' | 'fail'")
+        if if_exists == "replace":
+            conn.execute(text(f'DROP TABLE IF EXISTS "{schema}"."{table}"'))
+
+        # Create an empty table from the DataFrame schema
+        # (0 rows => just DDL; much faster than inserting)
+        df.head(0).to_sql(name=table, con=conn, schema=schema, if_exists="append", index=False)
+
+        # Optionally flip to UNLOGGED for raw/preprocessed staging (faster writes)
+        if make_unlogged:
+            conn.execute(text(f'ALTER TABLE "{schema}"."{table}" SET UNLOGGED'))
+
+    # Dump to a temp CSV and COPY it (fastest path)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", encoding="utf-8", newline="") as tmp:
+        csv_path = tmp.name
+        # choose na_rep="" if you prefer blanks over "NaN"
+        df.to_csv(tmp, index=False)
+
+    try:
+        raw = engine.raw_connection()  # psycopg2 connection
+        try:
+            with raw.cursor() as cur, open(csv_path, "r", encoding="utf-8") as f:
+                cur.copy_expert(
+                    f'COPY "{schema}"."{table}" FROM STDIN WITH (FORMAT CSV, HEADER TRUE)',
+                    f
+                )
+            raw.commit()
+        finally:
+            raw.close()
+    finally:
+        try: os.remove(csv_path)
+        except OSError: pass
+      
+  
+def preprocessing(csv_path, interval="5s"):
+    # DB settings
+    raw_schema = "raw"
+    preprocessed_schema = "preprocessed"
+    engine = make_engine_from_env()
+    ensure_schema(engine, raw_schema)
+    ensure_schema(engine, preprocessed_schema)
+
     all_files = [f for f in listdir(csv_path) if isfile(join(csv_path, f))]
     dfs = []
 
     for file in all_files:
+        table_name = file.replace(".csv", "").lower()
         file_path = join(csv_path, file)
         print(f"[LOAD] {file_path}")
+
         temp_df = pd.read_csv(file_path)
+        temp_df.columns = ["_".join(c.strip().lower().split()) for c in temp_df.columns]
         temp_df = selecting_feature_set(temp_df)
         temp_df, report = handling_missing_vals(temp_df)
-        
         pprint(report, sort_dicts=False, width=100)
 
-        # Parse timestamp
-        temp_df[" Timestamp"] = pd.to_datetime(temp_df[" Timestamp"], errors="coerce")
-        """temp_df = temp_df.dropna(subset=[" Timestamp"]).set_index(" Timestamp").sort_index()
+        print(f"[SAVE] raw -> {raw_schema}.{table_name} (COPY)")
+        save_fast_with_copy(
+            engine,
+            df=temp_df,
+            schema=raw_schema,
+            table=table_name,
+            if_exists="replace",
+            make_unlogged=True,     # speed boost for staging tables
+            sanitize_cols=True      # replace odd chars like "/" with "_"
+        )
 
-        # --- Resample into fixed intervals ---
-        ts = temp_df.resample(interval).agg({
-            " Total Fwd Packets": "sum",
-            " Total Backward Packets": "sum",
-            "Flow Bytes/s": "mean",
-            " Flow Packets/s": "mean",
-            " Average Packet Size": "mean",
-            " Packet Length Mean": "mean",
-            " Packet Length Std": "mean",
-            " Fwd Packet Length Mean": "mean",
-            " Bwd Packet Length Mean": "mean",
-            " Flow IAT Mean": "mean",
-            " Flow IAT Std": "mean",
-            " Fwd IAT Mean": "mean",
-            " Bwd IAT Mean": "mean",
-            "Active Mean": "mean",
-            "Idle Mean": "mean",
-            " Down/Up Ratio": "mean",
-            " Avg Fwd Segment Size": "mean",
-            " Avg Bwd Segment Size": "mean",
-            " SYN Flag Count": "sum",
-            " ACK Flag Count": "sum",
-            " RST Flag Count": "sum",
-            " Protocol": "first",            # categorical → keep first (or mode)
-            " Destination Port": "first",    # same
-            " Label": lambda s: (s != "BENIGN").mean()  # attack ratio per window
-        })
-
-        ts = ts.fillna(0)  # fill gaps with 0 (no traffic)
-        dfs.append(ts)"""
+        temp_df = resampling(temp_df, interval)
         
+        print(f"[SAVE] preprocessed -> {preprocessed_schema}.{table_name} (COPY)")
+        save_fast_with_copy(
+            engine,
+            df=temp_df,
+            schema=preprocessed_schema,
+            table=table_name,
+            if_exists="replace",
+            make_unlogged=True,     # speed boost for staging tables
+            sanitize_cols=True      # replace odd chars like "/" with "_"
+        )
+        
+        dfs.append(temp_df)
         break
-  
 
     return dfs
 
@@ -233,7 +390,7 @@ def combining_dfs(dfs):
 
     # --- Step 5: Concatenate into one big DataFrame ---
     big_df = pd.concat(aligned_dfs, ignore_index=True)
-
+    
 
 def main():
     # --- Settings ---

@@ -7,56 +7,66 @@ from dotenv import load_dotenv
 from pprint import pprint
 from sqlalchemy import create_engine, text
 from sqlalchemy.types import DateTime, Float, Integer
+import re
 
 
-def selecting_feature_set(df):
-    print("----- 1. Selecting Final Feature Set -----")
-    selected_features = [
-        "timestamp",
+# -----------------------------
+# Unified feature set (for both)
+# -----------------------------
+UNIFIED_FEATURES = [
+    # time
+    "timestamp",
 
-        # Traffic volume & throughput
-        "flow_duration",
-        "total_fwd_packets",
-        "total_backward_packets",
-        "flow_bytes/s",
-        "flow_packets/s",
-        "average_packet_size",
+    # core volume/throughput
+    "flow_duration", "total_fwd_packets", "total_backward_packets",
+    "flow_bytes_s", "flow_packets_s",
 
-        # Packet size stats
-        "packet_length_mean",
-        "packet_length_std",
-        "fwd_packet_length_mean",
-        "bwd_packet_length_mean",
+    # packet sizes (means + spread/extremes)
+    "average_packet_size", "packet_length_mean", "packet_length_std",
+    "fwd_packet_length_mean", "bwd_packet_length_mean",
+    "min_packet_length", "max_packet_length", "packet_length_variance",
 
-        # Timing / burstiness 
-        "flow_iat_mean",
-        "flow_iat_std",
-        "fwd_iat_mean",
-        "bwd_iat_mean",
-        "active_mean",
-        "idle_mean",
+    # timing / burstiness (means + spread/extremes)
+    "flow_iat_mean", "flow_iat_std", "flow_iat_max", "flow_iat_min",
+    "fwd_iat_mean", "fwd_iat_std", "bwd_iat_mean", "bwd_iat_std",
+    "active_mean", "active_std", "active_max", "active_min",
+    "idle_mean",  "idle_std",  "idle_max",  "idle_min",
 
-        # Asymmetry 
-        "down/up_ratio",
-        "avg_fwd_segment_size",
-        "avg_bwd_segment_size",
+    # asymmetry
+    "down_up_ratio", "avg_fwd_segment_size", "avg_bwd_segment_size",
 
-        # TCP flag behavior 
-        "syn_flag_count",
-        "ack_flag_count",
-        "rst_flag_count",
+    # flags (broader set)
+    "syn_flag_count", "ack_flag_count", "rst_flag_count",
+    "psh_flag_count", "urg_flag_count", "cwe_flag_count", "ece_flag_count",
 
-        # Protocol context 
-        "protocol",
-        "destination_port",
+    # bulk / subflow / header
+    "fwd_avg_bytes_bulk", "fwd_avg_packets_bulk", "fwd_avg_bulk_rate",
+    "bwd_avg_bytes_bulk", "bwd_avg_packets_bulk", "bwd_avg_bulk_rate",
+    "subflow_fwd_packets", "subflow_fwd_bytes",
+    "subflow_bwd_packets", "subflow_bwd_bytes",
+    "fwd_header_length", "bwd_header_length", "fwd_header_length_1",
 
-        # Label for anomaly detection
-        "label"
-    ]
+    # other traffic indicators
+    "init_win_bytes_forward", "init_win_bytes_backward",
+    "act_data_pkt_fwd", "min_seg_size_forward",
 
-    
-    df = df[selected_features]
-    return df
+    # categorical context
+    "protocol", "destination_port",
+
+    # label (optional)
+    "label",
+]
+
+
+def selecting_feature_set(df: pd.DataFrame) -> pd.DataFrame:
+    print("----- 1. Selecting Final (Unified) Feature Set -----")
+    # keep only columns that exist in df
+    available = [c for c in UNIFIED_FEATURES if c in df.columns]
+    # put timestamp first if present
+    if "timestamp" in available:
+        available = ["timestamp"] + [c for c in available if c != "timestamp"]
+    print(f"Selected {len(available)} / {len(UNIFIED_FEATURES)} columns.")
+    return df[available].copy()
 
 
 def missing_summary(df):
@@ -91,44 +101,53 @@ def handling_missing_vals(
     mode="train",
     high_thresh=0.80,   # ≥80% missing → drop (unless protected)
     ffill_limit=6,      # limit for forward-fill
-    protected_cols=(" Protocol", " Destination Port", " Label"),
+    protected_cols=("protocol", "destination_port", "label"),
     return_report=True
 ):
     print("----- 2. Handling Missing Values In Data -----")
     print("----- Missing Report -----")
     df = df.copy()
     col_summary, row_summary = missing_summary(df)
-    print(col_summary)
-    print(row_summary)
 
-    # column groups 
+    # numeric-like columns to smooth/interp
     interp_cols = [
         "flow_duration", "total_fwd_packets", "total_backward_packets",
-        "flow_bytes/s", "flow_packets/s", "average_packet_size",
-        "packet_length_mean", "packet_length_std",
+        "flow_bytes_s", "flow_packets_s", "average_packet_size",
+        "packet_length_mean", "packet_length_std", "packet_length_variance",
         "fwd_packet_length_mean", "bwd_packet_length_mean",
-        "down/up_ratio", "avg_fwd_segment_size", "avg_bwd_segment_size"
+        "min_packet_length", "max_packet_length",
+        "down_up_ratio", "avg_fwd_segment_size", "avg_bwd_segment_size",
+        "flow_iat_mean", "flow_iat_std", "flow_iat_max", "flow_iat_min",
+        "fwd_iat_mean", "fwd_iat_std", "bwd_iat_mean", "bwd_iat_std",
+        "active_mean", "active_std", "active_max", "active_min",
+        "idle_mean", "idle_std", "idle_max", "idle_min",
+        "fwd_header_length", "bwd_header_length", "fwd_header_length_1",
+        "fwd_avg_bytes_bulk", "fwd_avg_packets_bulk", "fwd_avg_bulk_rate",
+        "bwd_avg_bytes_bulk", "bwd_avg_packets_bulk", "bwd_avg_bulk_rate",
+        "subflow_fwd_packets", "subflow_fwd_bytes",
+        "subflow_bwd_packets", "subflow_bwd_bytes",
+        "init_win_bytes_forward", "init_win_bytes_backward",
+        "act_data_pkt_fwd", "min_seg_size_forward",
+        "syn_flag_count", "ack_flag_count", "rst_flag_count",
+        "psh_flag_count", "urg_flag_count", "cwe_flag_count", "ece_flag_count",
     ]
 
+    # ffill-preferred columns (incl. categoricals / flags that can be sticky)
     ffill_cols = [
-        "flow_iat_mean", "flow_iat_std", "fwd_iat_mean", "bwd_iat_mean",
-        "active_mean", "idle_mean",
-        "syn_flag_count", "ack_flag_count", "rst_flag_count",
         "protocol", "destination_port"
     ]
 
     categoricals = ["protocol", "destination_port"]
 
-
-    # filter only existing columns
+    # filter existing
     interp_cols = [c for c in interp_cols if c in df.columns]
     ffill_cols  = [c for c in ffill_cols  if c in df.columns]
     categoricals = [c for c in categoricals if c in df.columns]
 
-    # 1) check missingness 
+    # 1) missing fractions
     miss_frac = df.isna().mean().to_dict()
 
-    # 2) drop heavily missing columns (except protected)
+    # 2) drop heavily missing (except protected)
     drop_cols = [col for col, frac in miss_frac.items() if frac >= high_thresh and col not in protected_cols]
     if drop_cols:
         df.drop(columns=drop_cols, inplace=True)
@@ -136,14 +155,14 @@ def handling_missing_vals(
         ffill_cols  = [c for c in ffill_cols  if c in df.columns]
         categoricals = [c for c in categoricals if c in df.columns]
 
-    # 3) numeric features: ffill → interpolate → median fallback
+    # 3) numeric-ish: ffill → interpolate → median fallback
     if interp_cols:
         df[interp_cols] = df[interp_cols].ffill(limit=ffill_limit)
         df[interp_cols] = df[interp_cols].interpolate(method="linear", limit=ffill_limit, limit_direction="both")
         medians = df[interp_cols].median(numeric_only=True)
         df[interp_cols] = df[interp_cols].fillna(medians)
 
-    # 4) burstiness/flags/categoricals
+    # 4) sticky categoricals
     for col in ffill_cols:
         df[col] = df[col].ffill(limit=ffill_limit)
         if df[col].isna().any():
@@ -153,12 +172,12 @@ def handling_missing_vals(
             except Exception:
                 df[col] = df[col].fillna("Unknown" if col in categoricals else 0)
 
-    # 5) label handling 
-    if " Label" in df.columns:
+    # 5) label
+    if "label" in df.columns:
         if mode == "train":
-            df = df.dropna(subset=[" Label"])
+            df = df.dropna(subset=["label"])
         elif mode == "inference":
-            df[" Label"] = df[" Label"].fillna("Unknown")
+            df["label"] = df["label"].fillna("Unknown")
         else:
             raise ValueError("mode must be 'train' or 'inference'")
 
@@ -176,93 +195,156 @@ def handling_missing_vals(
     return (df, report) if return_report else df
 
 
-def _mode(series: pd.Series):
-    s = series.dropna()
-    if s.empty:
-        return np.nan
-    m = s.mode()
-    return m.iloc[0] if not m.empty else np.nan
+def _drop_fully_empty_bins(agg: pd.DataFrame) -> pd.DataFrame:
+    # If a bin has zero counts and all mean-like features are NaN, drop it.
+    count_like = [
+        "total_fwd_packets","total_backward_packets","total_packets",
+        "syn_flag_count","ack_flag_count","rst_flag_count",
+        "psh_flag_count","urg_flag_count","cwe_flag_count","ece_flag_count",
+        "subflow_fwd_packets","subflow_bwd_packets","act_data_pkt_fwd"
+    ]
+    mean_like = [
+        "average_packet_size","packet_length_mean","packet_length_std","packet_length_variance",
+        "fwd_packet_length_mean","bwd_packet_length_mean",
+        "min_packet_length","max_packet_length",
+        "flow_iat_mean","flow_iat_std","flow_iat_max","flow_iat_min",
+        "fwd_iat_mean","fwd_iat_std","bwd_iat_mean","bwd_iat_std",
+        "active_mean","active_std","active_max","active_min",
+        "idle_mean","idle_std","idle_max","idle_min",
+        "down_up_ratio","avg_fwd_segment_size","avg_bwd_segment_size",
+        "flow_duration_s","flow_bytes_s","flow_packets_s",
+        "fwd_header_length","bwd_header_length","fwd_header_length_1",
+        "fwd_avg_bytes_bulk","fwd_avg_packets_bulk","fwd_avg_bulk_rate",
+        "bwd_avg_bytes_bulk","bwd_avg_packets_bulk","bwd_avg_bulk_rate",
+        "subflow_fwd_bytes","subflow_bwd_bytes",
+        "init_win_bytes_forward","init_win_bytes_backward","min_seg_size_forward"
+    ]
+
+    present_counts = pd.Series(0, index=agg.index)
+    for c in count_like:
+        if c in agg.columns:
+            present_counts = present_counts.add(agg[c].fillna(0), fill_value=0)
+
+    if any(c in agg.columns for c in mean_like):
+        all_means_nan = agg[[c for c in mean_like if c in agg.columns]].isna().all(axis=1)
+    else:
+        all_means_nan = pd.Series(False, index=agg.index)
+
+    mask_empty = present_counts.eq(0) & all_means_nan
+    return agg.loc[~mask_empty]
 
 
-def _top_attack_type(series: pd.Series):
-    s = series.dropna().astype(str)
-    att = s[s != "BENIGN"]
-    if att.empty:
-        return "BENIGN"
-    m = att.mode()
-    return m.iloc[0] if not m.empty else "BENIGN"
-
-
-def resampling(df: pd.DataFrame, interval: str = "5s") -> pd.DataFrame:
+def resampling_by_protocol(df: pd.DataFrame, interval: str = "5s",
+                           align_grid: bool = True,  # <- new
+                           ffill_categoricals: bool = True,
+                           drop_empty_bins: bool = False):
     df = df.copy()
 
-    # --- timestamp -> index (sabit grid & sağ kapalı pencere)
+    # --- timestamp -> index
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
 
-    # --- birim düzeltmesi ve yardımcı kolonlar
-    # CICDDoS2019: Flow Duration mikro-saniye -> saniye
-    df["flow_duration_s"] = pd.to_numeric(df.get("flow_duration", 0), errors="coerce").fillna(0) / 1e6
-    df["total_packets"] = pd.to_numeric(df.get("total_fwd_packets", 0), errors="coerce").fillna(0) + \
-                          pd.to_numeric(df.get("total_backward_packets", 0), errors="coerce").fillna(0)
+    if "protocol" not in df.columns:
+        raise ValueError("protocol column is required for protocol-grouped resampling")
 
-    # --- agregasyon
-    agg = df.resample(interval, label="right", closed="right", origin="epoch").agg({
-        "total_fwd_packets": "sum",
-        "total_backward_packets": "sum",
-        "total_packets": "sum",
-        "syn_flag_count": "sum",
-        "ack_flag_count": "sum",
-        "rst_flag_count": "sum",
-        "flow_duration_s": "sum",
-        "average_packet_size": "mean",
-        "packet_length_mean": "mean",
-        "packet_length_std": "mean",
-        "fwd_packet_length_mean": "mean",
-        "bwd_packet_length_mean": "mean",
-        "flow_iat_mean": "mean",
-        "flow_iat_std": "mean",
-        "fwd_iat_mean": "mean",
-        "bwd_iat_mean": "mean",
-        "active_mean": "mean",
-        "idle_mean": "mean",
-        "down/up_ratio": "mean",
-        "avg_fwd_segment_size": "mean",
-        "avg_bwd_segment_size": "mean",
-        "protocol": lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else np.nan,
-        "destination_port": lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else np.nan,
-        "label": lambda s: (
+    # helpers
+    if "flow_duration" in df.columns:
+        df["flow_duration_s"] = pd.to_numeric(df["flow_duration"], errors="coerce").fillna(0) / 1e6
+    else:
+        df["flow_duration_s"] = 0
+
+    if ("total_fwd_packets" in df.columns) or ("total_backward_packets" in df.columns):
+        df["total_packets"] = pd.to_numeric(df.get("total_fwd_packets", 0), errors="coerce").fillna(0) + \
+                              pd.to_numeric(df.get("total_backward_packets", 0), errors="coerce").fillna(0)
+
+    sum_cols = [
+        "total_fwd_packets","total_backward_packets","total_packets",
+        "syn_flag_count","ack_flag_count","rst_flag_count",
+        "psh_flag_count","urg_flag_count","cwe_flag_count","ece_flag_count",
+        "subflow_fwd_packets","subflow_bwd_packets","subflow_fwd_bytes","subflow_bwd_bytes",
+        "act_data_pkt_fwd"
+    ]
+    mean_cols = [
+        "average_packet_size","packet_length_mean","packet_length_std","packet_length_variance",
+        "fwd_packet_length_mean","bwd_packet_length_mean",
+        "fwd_iat_mean","fwd_iat_std","bwd_iat_mean","bwd_iat_std",
+        "flow_iat_mean","flow_iat_std",
+        "active_mean","active_std","idle_mean","idle_std",
+        "down_up_ratio","avg_fwd_segment_size","avg_bwd_segment_size",
+        "fwd_header_length","bwd_header_length","fwd_header_length_1",
+        "fwd_avg_bytes_bulk","fwd_avg_packets_bulk","fwd_avg_bulk_rate",
+        "bwd_avg_bytes_bulk","bwd_avg_packets_bulk","bwd_avg_bulk_rate",
+        "init_win_bytes_forward","init_win_bytes_backward","min_seg_size_forward", "flow_bytes_s",
+    ]
+    max_cols = ["flow_iat_max","active_max","idle_max","max_packet_length"]
+    min_cols = ["flow_iat_min","active_min","idle_min","min_packet_length"]
+
+    agg_map = {}
+    for c in sum_cols:
+        if c in df.columns: agg_map[c] = "sum"
+    for c in mean_cols:
+        if c in df.columns: agg_map[c] = "mean"
+    for c in max_cols:
+        if c in df.columns: agg_map[c] = "max"
+    for c in min_cols:
+        if c in df.columns: agg_map[c] = "min"
+
+    if "destination_port" in df.columns:
+        agg_map["destination_port"] = lambda s: s.dropna().mode().iloc[0] if not s.dropna().mode().empty else np.nan
+    if "label" in df.columns:
+        agg_map["label"] = lambda s: (
             "BENIGN" if s.dropna().eq("BENIGN").all()
             else (s[s.ne("BENIGN")].mode().iloc[0] if not s[s.ne("BENIGN")].mode().empty else "BENIGN")
-        ),
-    })
+        )
 
-    # --- oran/ hızlar (0 süreye karşı güvenli)
-    dur = agg["flow_duration_s"].replace(0, np.nan)  # 0 saniyeyi NaN yap → bölme inf olmaz
-    agg["flow_packets_s"] = agg["total_packets"] / dur
-    # Gerçek byte toplamları yoksa bytes/s hesaplamasını atla; varsa burada kullan:
-    # agg["flow_bytes_s"] = agg["total_bytes"] / dur
+    agg_map["flow_duration_s"] = "sum"
 
-    # --- isim iyileştirme: label -> top_attack_type
-    agg = agg.rename(columns={"label": "top_attack_type"})
+    # --- per-protocol resample (aligned bin edges via origin="epoch")
+    grp = (df.groupby("protocol", dropna=False)
+             .resample(interval, label="right", closed="right", origin="epoch")
+             .agg(agg_map))
 
-    # --- inf/-inf -> NaN; sayısallar için makul doldurma
-    agg = agg.replace([np.inf, -np.inf], np.nan)
-    count_cols = ["total_fwd_packets","total_backward_packets","total_packets",
-                  "syn_flag_count","ack_flag_count","rst_flag_count","flow_duration_s"]
-    for c in count_cols:
-        if c in agg.columns:
-            agg[c] = agg[c].fillna(0)
+    # --- global grid alignment (same timestamps for every protocol)
+    if align_grid:
+        protos = grp.index.get_level_values("protocol").unique()
+        # use the original df time span for the grid
+        start = df.index.min().floor(interval)
+        end   = df.index.max().ceil(interval)
+        grid = pd.date_range(start, end, freq=interval)
+        full_idx = pd.MultiIndex.from_product([protos, grid], names=["protocol","timestamp"])
+        grp = grp.reindex(full_idx)
 
-    # top_attack_type boşsa BENIGN
-    if "top_attack_type" in agg.columns:
-        agg["top_attack_type"] = agg["top_attack_type"].fillna("BENIGN")
+    # derive flow_packets_s AFTER reindexing/filling
+    if "total_packets" in grp.columns:
+        dur = grp["flow_duration_s"].where(grp["flow_duration_s"] > 0)
+        grp["flow_packets_s"] = (grp["total_packets"] / dur).where(dur.notna())
 
-    # --- timestamp'i kolona geri koy
-    agg.index.name = "timestamp"
-    agg = agg.reset_index()
+    grp = grp.replace([np.inf, -np.inf], np.nan)
 
-    return agg
+    # fill count-like with 0 (no flows in bin ⇒ 0)
+    count_like = [c for c in [
+        "total_fwd_packets","total_backward_packets","total_packets",
+        "syn_flag_count","ack_flag_count","rst_flag_count",
+        "psh_flag_count","urg_flag_count","cwe_flag_count","ece_flag_count",
+        "subflow_fwd_packets","subflow_bwd_packets","act_data_pkt_fwd",
+        "flow_duration_s"
+    ] if c in grp.columns]
+    for c in count_like:
+        grp[c] = grp[c].fillna(0)
+
+    # optional: forward-fill categorical context within protocol
+    if ffill_categoricals and "destination_port" in grp.columns:
+        grp["destination_port"] = grp.groupby(level=0)["destination_port"].ffill(limit=1)
+
+    # optionally drop bins that remain completely empty
+    if drop_empty_bins:
+        grp = _drop_fully_empty_bins(grp)
+
+    grp = grp.reset_index()  # protocol, timestamp, ...
+    num_cols = grp.select_dtypes(include=[np.number]).columns
+    grp[num_cols] = grp[num_cols].round(2)
+    return grp
+
 
 
 def make_engine_from_env():
@@ -282,14 +364,14 @@ def ensure_schema(engine, schema: str):
 
 
 def save_fast_with_copy(engine, df: pd.DataFrame, schema: str, table: str,
-                         if_exists: str = "replace", make_unlogged: bool = True,
-                         sanitize_cols: bool = True):
+                        if_exists: str = "replace", make_unlogged: bool = True,
+                        sanitize_cols: bool = True):
     """Create table from df schema, then bulk-load rows using COPY (very fast)."""
     # (optional) sanitize weird column names for DB friendliness
     if sanitize_cols:
         safe_cols = []
         for c in df.columns:
-            cc = re.sub(r"\W+", "_", c).strip("_").lower()  # letters/digits/_ only
+            cc = re.sub(r"\W+", "_", c.strip().lower()).strip("_").lower()  # letters/digits/_ only
             safe_cols.append(cc or "col")
         df = df.copy()
         df.columns = safe_cols
@@ -301,7 +383,6 @@ def save_fast_with_copy(engine, df: pd.DataFrame, schema: str, table: str,
             conn.execute(text(f'DROP TABLE IF EXISTS "{schema}"."{table}"'))
 
         # Create an empty table from the DataFrame schema
-        # (0 rows => just DDL; much faster than inserting)
         df.head(0).to_sql(name=table, con=conn, schema=schema, if_exists="append", index=False)
 
         # Optionally flip to UNLOGGED for raw/preprocessed staging (faster writes)
@@ -311,7 +392,6 @@ def save_fast_with_copy(engine, df: pd.DataFrame, schema: str, table: str,
     # Dump to a temp CSV and COPY it (fastest path)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", encoding="utf-8", newline="") as tmp:
         csv_path = tmp.name
-        # choose na_rep="" if you prefer blanks over "NaN"
         df.to_csv(tmp, index=False)
 
     try:
@@ -328,10 +408,22 @@ def save_fast_with_copy(engine, df: pd.DataFrame, schema: str, table: str,
     finally:
         try: os.remove(csv_path)
         except OSError: pass
-      
-  
+
+
+def protocol_overview(df: pd.DataFrame):
+    g = df.groupby("protocol", dropna=False)
+    view = g.agg(
+        bins=("timestamp","count"),
+        start=("timestamp","min"),
+        end=("timestamp","max"),
+        pct_nonzero_pkts=("total_packets", lambda s: float((s>0).mean()*100) if "total_packets" in df.columns else np.nan),
+        pct_missing_any=("timestamp", lambda _: float(g.apply(lambda x: x.drop(columns=["timestamp"]).isna().any(axis=1).mean()*100).mean()))
+    ).sort_values("bins", ascending=False)
+    print(view)
+    return view
+
+
 def preprocessing(csv_path, interval="5s"):
-    # DB settings
     raw_schema = "raw"
     preprocessed_schema = "preprocessed"
     engine = make_engine_from_env()
@@ -339,7 +431,7 @@ def preprocessing(csv_path, interval="5s"):
     ensure_schema(engine, preprocessed_schema)
 
     all_files = [f for f in listdir(csv_path) if isfile(join(csv_path, f))]
-    dfs = []
+    perfile_rs = []
 
     for file in all_files:
         table_name = file.replace(".csv", "").lower()
@@ -347,60 +439,58 @@ def preprocessing(csv_path, interval="5s"):
         print(f"[LOAD] {file_path}")
 
         temp_df = pd.read_csv(file_path)
-        temp_df.columns = ["_".join(c.strip().lower().split()) for c in temp_df.columns]
+
+        # sanitize columns early
+        temp_df.columns = [
+            re.sub(r"\W+", "_", c.strip().lower()).strip("_")
+            for c in temp_df.columns
+        ]
+
+        # select unified features that exist
         temp_df = selecting_feature_set(temp_df)
+
+        # handle missings
         temp_df, report = handling_missing_vals(temp_df)
         pprint(report, sort_dicts=False, width=100)
 
-        print(f"[SAVE] raw -> {raw_schema}.{table_name} (COPY)")
-        save_fast_with_copy(
-            engine,
-            df=temp_df,
-            schema=raw_schema,
-            table=table_name,
-            if_exists="replace",
-            make_unlogged=True,     # speed boost for staging tables
-            sanitize_cols=True      # replace odd chars like "/" with "_"
-        )
+        # resample per file
+        rs = resampling_by_protocol(temp_df, interval)
+        rs["source_file"] = table_name  # lineage (optional)
+        perfile_rs.append(rs)
 
-        temp_df = resampling(temp_df, interval)
-        
-        print(f"[SAVE] preprocessed -> {preprocessed_schema}.{table_name} (COPY)")
-        save_fast_with_copy(
-            engine,
-            df=temp_df,
-            schema=preprocessed_schema,
-            table=table_name,
-            if_exists="replace",
-            make_unlogged=True,     # speed boost for staging tables
-            sanitize_cols=True      # replace odd chars like "/" with "_"
-        )
-        
-        dfs.append(temp_df)
-        break
+    # combine already-resampled files (no second global resample)
+    big_df = pd.concat(perfile_rs, ignore_index=True).sort_values("timestamp")
 
-    return dfs
+    print(f"[SAVE] preprocessed -> {preprocessed_schema}.combined (COPY)")
+    save_fast_with_copy(
+        engine,
+        df=big_df,
+        schema=preprocessed_schema,
+        table="combined",
+        if_exists="replace",
+        make_unlogged=True,
+        sanitize_cols=True
+    )
 
-
-
-def combining_dfs(dfs):  
-    cols = dfs[0].columns
-    # --- Step 4: Align DataFrames to only common columns ---
-    aligned_dfs = [df.reindex(columns=sorted(cols)) for df in dfs]
-
-    # --- Step 5: Concatenate into one big DataFrame ---
-    big_df = pd.concat(aligned_dfs, ignore_index=True)
+    # diagnostics
+    total_bins = len(big_df)
+    empty_bins = big_df.drop(columns=["timestamp"]).isna().all(axis=1).sum()
+    print(f"Empty bins (all-NaN rows): {empty_bins}/{total_bins} ({empty_bins/max(total_bins,1):.1%})")
+    print("Top sparsity after per-file resample then combine:")
+    print((big_df.isna().mean().sort_values(ascending=False)*100).round(2).head(10))
     
+    # after big_df = ...
+    print("\n=== Protocol overview ===")
+    protocol_overview(big_df)
+
+    return big_df
+
 
 def main():
     # --- Settings ---
     csv_path = "datasets/03-11"
     preprocessing(csv_path)
-    """load_dotenv()
 
-    key = os.environ.get("SECRET_KEY")
-    print(key)"""
-    
 
 if __name__ == "__main__":
     main()
